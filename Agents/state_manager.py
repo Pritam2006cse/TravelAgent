@@ -8,6 +8,8 @@ class ItineraryLeg(BaseModel):
     mode: Literal["air","train"]
     operator: str
     identification_number: Union[str, int]
+    train_name: Optional[str] = None
+    flight_name: Optional[str] = None
     from_location: str
     to_location: str
     departure_date: str

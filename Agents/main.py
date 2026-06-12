@@ -1,6 +1,6 @@
 # Main Module
-from state_manager import TravelState
-from agents import FlightAgent,RailAgent,ValidatorAgent
+from Agents.state_manager import TravelState
+from Agents.agents import (FlightAgent,RailAgent,ValidatorAgent)
 import json
 
 def run_swarm():

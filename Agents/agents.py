@@ -1,14 +1,58 @@
 # Agents Module
 import os
-from openai import OpenAI
 from dotenv import load_dotenv
-from state_manager import TravelState, ItineraryLeg, DestinationSuggestion, DestinationSuggestionList
+from Agents.state_manager import (TravelState, ItineraryLeg, DestinationSuggestion)
 import pandas as pd
 from typing import List
 import requests
+from Agents.llm_provider import ask_llm
+import json
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def normalize_leg(data: dict) -> dict:
+    # type normalization
+    if data.get("type") == "train":
+        data["type"] = "rail"
+    # mode normalization
+    if data.get("mode") == "rail":
+        data["mode"] = "train"
+    # status normalization
+    if data.get("status") == "booked":
+        data["status"] = "confirmed"
+    if data.get("status") == "scheduled":
+        data["status"] = "proposed"
+    return data
+
+def clean_json(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text.replace("```json", "", 1)
+    if text.startswith("```"):
+        text = text.replace("```", "", 1)
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+
+    if text.startswith("{"):
+        depth = 0
+        for i, char in enumerate(text):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[:i+1]
+    elif text.startswith("["):
+        depth = 0
+        for i, char in enumerate(text):
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[:i+1]
+    return text
 
 class TravelData:
     _token = None
@@ -273,72 +317,106 @@ class BaseAgent:
         state.agent_logs.append(log_entry)
 
 class DestinationSuggesterAgent(BaseAgent):
-    def run(self,user_prompt:str) -> List[DestinationSuggestion]:
-        system_prompt = (
-            "You are a Destination Curator for travelers in India. "
-            "Based on the user's stated interests (adventure, scenic beauty, "
-            "festivals, culture, relaxation, etc.), suggest 4 distinct destinations. "
-            "For each, give the destination name, a 1-2 sentence reason, and "
-            "what it's 'best_for' (one short tag like 'adventure' or 'scenic')."
-        )
+
+    def run(self, user_prompt: str) -> List[DestinationSuggestion]:
+
+        prompt = f"""
+        You are a Destination Curator for travelers in India.
+        Based on the user's interests, suggest exactly 4 destinations.
+        User Request:
+        {user_prompt}
+        Return ONLY valid JSON.
+        Example:
+        [
+          {{
+            "destination": "Jaipur",
+            "reason": "Historic forts and rich culture.",
+            "best_for": "culture"
+          }},
+          {{
+            "destination": "Manali",
+            "reason": "Excellent trekking and mountain scenery.",
+            "best_for": "adventure"
+          }}
+        ]
+        Rules:
+        - Return exactly 5 destinations
+        - No markdown
+        - No explanation
+        - JSON array only.Output must be parseable by Python json.loads().
+        """
         try:
-            response = client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format=DestinationSuggestionList
+            response = ask_llm(prompt)
+            suggestions_data = json.loads(
+                clean_json(response)
             )
-            return response.choices[0].message.parsed.suggestions
-        except Exception as e:
-            print(f"[DestinationSuggesterAgent] Error: {str(e)}")
-            # Fallback suggestions if LLM call fails
             return [
-                DestinationSuggestion(destination="Jaipur", reason="Rich culture, forts, and vibrant markets.", best_for="culture"),
-                DestinationSuggestion(destination="Manali", reason="Mountains, trekking, and adventure sports.", best_for="adventure"),
-                DestinationSuggestion(destination="Goa", reason="Beaches, relaxation, and nightlife.", best_for="relaxation"),
-                DestinationSuggestion(destination="Pushkar", reason="Famous for the Pushkar Camel Fair and spiritual sites.", best_for="festivals"),
+                DestinationSuggestion(**item)
+                for item in suggestions_data
             ]
+        except Exception as e:
+            print(
+                f"[DestinationSuggesterAgent] Error: {str(e)}"
+            )
+            return []
     
+
 class FlightAgent(BaseAgent):
     def run(self,state: TravelState):
         self.log(state,"Analyzing travel guide according to user...")
         if any(leg.type=="flight" for leg in state.current_itinerary):
             self.log(state, "Flight leg already present. Skipping.")
             return
-        intent_check = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are an analyzer. Respond with 'YES' if the user's travel request requires an airplane/flight, or 'NO' if it can be done entirely by ground/train or explicitly requests no flights. Do not give any false positive reply."},
-                {"role": "user", "content": state.user_prompt}
-            ]
-        )
-        if "NO" in intent_check.choices[0].message.content.upper():
+        intent_check = ask_llm(f"""Analyze this travel request:{state.user_prompt}Determine travel intent.""").strip().upper()
+        if intent_check=="NO":
             self.log(state, "Flight routing not required for this itinerary. Stepping aside.")
             return
-        system_prompt = (
-            "You are an expert Flight Logistics Agent. Your job is to analyze the user's travel request "
-            "and suggest the primary long-haul flight leg. You MUST return a single valid flight itinerary segment. "
-            "Provide a highly realistic airline operator (e.g., Virgin Atlantic) and a valid flight identification_number (e.g., VS4)."
-            "IMPORTANT: departure_date and arrival_date must be in 'YYYY-MM-DD' format. "
-            "departure_time and arrival_time must be in 'HH:MM:SS' format (24-hour, no date or timezone). "
-            "Set the leg_index to 0.(Year 2026)."
-        )
         try:
-            response = client.beta.chat.completions.parse(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"User Request: {state.user_prompt}. Max Budget: ${state.max_budget}"}
-                ],
-                response_format=ItineraryLeg # Enforces output schema matches our state file!
-            )
-            flight_leg = response.choices[0].message.parsed
+            response = ask_llm(f"""
+            Generate a valid flight itinerary.
+            User Request:
+            {state.user_prompt}
+            Return ONLY ONE valid JSON object — do not repeat, duplicate, or output multiple JSON blocks.
+            Example format:
+            {{
+            "type":"flight",
+            "mode":"air",
+            "operator":" ",
+            "identification_number":" ",
+            "flight_name":" ",
+            "from_location":" ",
+            "to_location":" ",
+            "departure_date":" ",
+            "departure_time":" ",
+            "arrival_date":" ",
+            "arrival_time":" ",
+            "cost": ,
+            "status":" "
+            }}
+            Output EXACTLY ONE JSON object. No markdown. No explanation. No trailing text after the closing brace. Output must be parseable by Python json.loads().""")
+            print("\nRAW FLIGHT RESPONSE:")
+            print(repr(response))
+            flight_data = json.loads(clean_json(response))
+            if "itinerary" in flight_data:
+                flight_json = next(leg for leg in flight_data["itinerary"] if leg["type"] == "flight")
+            elif "legs" in flight_data:
+                flight_json = next(leg for leg in flight_data["legs"] if leg["type"] == "flight")
+            elif flight_data.get("type") == "flight":
+                flight_json = flight_data
+            else:
+                flight_json = flight_data
+            #flight_json = next(leg for leg in flight_data["itinerary"] if leg["type"] == "flight")
+            flight_json = normalize_leg(flight_json)
+            print("\nPARSED FLIGHT DATA:")
+            print(flight_data)
+
+            flight_leg = ItineraryLeg(leg_index=len(state.current_itinerary),**flight_json)
+
+            # Overwrite operator/identification_number with live Aviationstack data
             api_data = TravelData.get_live_flight(flight_leg.from_location, flight_leg.to_location)
             flight_leg.operator = api_data["real_operator"]
             flight_leg.identification_number = api_data["real_identification_no"]
-            flight_leg.leg_index = len(state.current_itinerary)
+
             state.current_itinerary.append(flight_leg)
             self.log(state, f"Proposed Flight: {flight_leg.from_location} -> {flight_leg.to_location}")
         except Exception as e:
@@ -350,15 +428,12 @@ class RailAgent(BaseAgent):
         if any(leg.type=="rail" for leg in state.current_itinerary):
             self.log(state,"Rail leg already exists.")
             return
-        intent_check = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are an analyzer. Respond with 'YES' if the user's travel request include any railway/rail/train, or 'NO' if it can be done entirely by air/flight or explicitly requests flights.Respond NO only if no rail transport is requested."},
-                {"role": "user", "content": state.user_prompt}
-            ]
-        )
-        if "NO" in intent_check.choices[0].message.content.upper():
-            self.log(state, "Rail leg not required for this itinerary. Stepping aside.")
+        intent_check = ask_llm(f"""Determine if rail transport is required.User request:{state.user_prompt}Reply only YES or NO.""").strip().upper()
+        if intent_check == "NO":
+            self.log(
+                state,
+                "Rail leg not required for this itinerary. Stepping aside."
+            )
             return
         system_prompt = (
             "You are a Rail Network Specialist. Review the user request and any current itinerary context. "
@@ -366,21 +441,52 @@ class RailAgent(BaseAgent):
             "If a flight leg is present, connect the train from the airport arrival city. "
             "If NO flight leg is present, build the entire journey using trains from the starting location. "
             "Set type to 'rail' and mode to 'train'. status must be 'proposed'."
+            "Provide a realistic rail operator name as 'operator' (e.g., 'Indian Railways'), "
+            "a train number as 'identification_number' (e.g., '12626'), "
+            "and the full train name as 'train_name' (e.g., 'Howrah Rajdhani Express'). "
             "IMPORTANT: departure_date and arrival_date must be in 'YYYY-MM-DD' format. "
             "departure_time and arrival_time must be in 'HH:MM:SS' format (24-hour, no date or timezone). "
             "Provide a realistic rail operator name (e.g., Eurostar) and a train identification_number or service identifier (e.g., ES9044)."
         )
         current_itinerary_context = str([leg.model_dump() for leg in state.current_itinerary])
         try:
-            response = client.beta.chat.completions.parse(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"User Request: {state.user_prompt}\nCurrent Progress: {current_itinerary_context}"}
-                ],
-                response_format=ItineraryLeg
-            )
-            rail_leg = response.choices[0].message.parsed
+            response = ask_llm(f"""
+            Generate a valid rail itinerary.
+            User Request:
+            {state.user_prompt}
+            Return ONLY valid JSON.
+            Example format:
+            {{
+            "type":" ",
+            "mode":" ",
+            "operator":" ",
+            "identification_number":" ",
+            "train_name":" ",
+            "from_location":" ",
+            "to_location":" ",
+            "departure_date":" ",
+            "departure_time":" ",
+            "arrival_date":" ",
+            "arrival_time":" ",
+            "cost": ,
+            "status":" "
+            }}No markdown.No explanation.JSON only.Do not wrap in ```json.Do not explain.Output must be parseable by Python json.loads().""")
+            rail_data = json.loads(clean_json(response))
+            if "itinerary" in rail_data:
+                rail_json = next(leg for leg in rail_data["itinerary"] if leg["type"] in ["train", "rail"])
+            elif "legs" in rail_data:
+                rail_json = next(leg for leg in rail_data["legs"] if leg["type"] == "rail")
+            elif rail_data.get("type") == "flight":
+                rail_json = rail_data
+            else:
+                rail_json = rail_data
+            #rail_json = next(leg for leg in rail_data["itinerary"] if leg["type"] in ["train", "rail"])
+            rail_json = normalize_leg(rail_json)
+            print("\nRAW RAIL RESPONSE:")
+            print(response)
+            print("\nPARSED RAIL DATA:")
+            print(rail_data)
+            rail_leg = ItineraryLeg(leg_index=len(state.current_itinerary),**rail_json)
             if rail_leg.from_location and rail_leg.to_location:
                 api_data = TravelData.get_live_rail(rail_leg.from_location, rail_leg.to_location)
                 rail_leg.operator = api_data["real_operator"]
@@ -407,7 +513,23 @@ class ValidatorAgent(BaseAgent):
             time_difference = (r_dep - f_arr).total_seconds() / 60
             if time_difference < 120: # Requires a minimum 2-hour transfer window
                 state.validation_errors.append(f"Temporal Breach: Layover is only {time_difference} mins. Need 120+ mins for safe customs extraction.")
-            if flight.to_location.lower() != rail.from_location.lower():
+            CITY_ALIASES = {
+                "kolkata": "kolkata",
+                "howrah": "kolkata",
+                "new delhi": "delhi",
+                "delhi": "delhi"
+            }
+
+            flight_dest = CITY_ALIASES.get(
+                flight.to_location.lower(),
+                flight.to_location.lower()
+            )
+
+            rail_origin = CITY_ALIASES.get(
+                rail.from_location.lower(),
+                rail.from_location.lower()
+            )
+            if flight_dest != rail_origin:
                 state.validation_errors.append("Route Breach: Rail journey does not begin where flight ends.")
         if flight and not rail:
             state.validation_errors.append("Incomplete itinerary: missing required rail segment.")
